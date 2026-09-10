@@ -1,16 +1,10 @@
-"""Goose agent: merges Databricks settings into ~/.config/goose/config.yaml.
+"""Goose coding agent support for the Databricks AI Gateway.
 
-Goose has a built-in Databricks provider that reads DATABRICKS_HOST from the
-config file and DATABRICKS_TOKEN from the environment (env var takes precedence
-over keyring). We merge only the three keys we own into the existing config so
-that user-defined extensions, preferences, and other settings are preserved.
-
-The token is injected as DATABRICKS_TOKEN at launch and refreshed every 30
-minutes so long-running sessions stay authenticated.
-
-Install goose from https://github.com/aaif-goose/goose — it ships as a native
-binary (not an npm package), typically installed to ~/.local/bin via:
-  curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+Goose has a built-in Databricks provider. Unity Gateway merges only the
+provider settings it owns into Goose's shared YAML config so user preferences
+and extensions survive. Databricks MCP servers are registered as local stdio
+extensions that run ``ug mcp-proxy``; the proxy owns token refresh, so bearer
+credentials are never persisted in Goose's config.
 """
 
 from __future__ import annotations
@@ -18,7 +12,6 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
-import threading
 from pathlib import Path
 
 from ucode.config_io import (
@@ -29,11 +22,10 @@ from ucode.config_io import (
     read_yaml_safe,
     write_yaml_file,
 )
-from ucode.databricks import (
-    TOKEN_REFRESH_INTERVAL_SECONDS,
-    get_databricks_token,
-)
+from ucode.databricks import get_databricks_token
 from ucode.state import mark_tool_managed, save_state
+
+from .args import LaunchOptions
 
 GOOSE_CONFIG_DIR = Path.home() / ".config" / "goose"
 GOOSE_CONFIG_PATH = GOOSE_CONFIG_DIR / "config.yaml"
@@ -41,40 +33,35 @@ GOOSE_BACKUP_PATH = APP_DIR / "goose-config.backup.yaml"
 
 SPEC: ToolSpec = {
     "binary": "goose",
-    "package": "",  # not an npm package; install from https://github.com/aaif-goose/goose
+    "package": "",  # native binary: https://github.com/aaif-goose/goose
     "display": "Goose",
     "config_path": GOOSE_CONFIG_PATH,
     "backup_path": GOOSE_BACKUP_PATH,
 }
 
-MANAGED_KEYS: list[str] = [
-    "DATABRICKS_HOST",
-    "GOOSE_PROVIDER",
-    "GOOSE_MODEL",
-    "OAUTH_TOKEN",
+MANAGED_KEYS: list[list[str]] = [
+    ["DATABRICKS_HOST"],
+    ["GOOSE_PROVIDER"],
+    ["GOOSE_MODEL"],
+    ["extensions", "skills"],
 ]
-
-GOOSE_MCP_AUTH_ENV_KEY = "OAUTH_TOKEN"
 
 
 def is_update_available() -> tuple[str, str] | None:
-    return None  # no npm update check for native binary
+    return None
 
 
 def default_model(state: dict) -> str | None:
-    """Prefer Claude sonnet, then opus, then haiku; fall back to gemini."""
+    """Prefer Claude Sonnet, then Opus/Haiku, and finally Gemini."""
     claude_models = state.get("claude_models") or {}
     for family in ("sonnet", "opus", "haiku"):
         if claude_models.get(family):
             return claude_models[family]
     gemini_models = state.get("gemini_models") or []
-    if gemini_models:
-        return gemini_models[0]
-    return None
+    return gemini_models[0] if gemini_models else None
 
 
 def render_overlay(workspace: str, model: str) -> dict:
-    """Return only the keys ucode manages — merged into the existing config."""
     return {
         "DATABRICKS_HOST": workspace,
         "GOOSE_PROVIDER": "databricks",
@@ -84,7 +71,7 @@ def render_overlay(workspace: str, model: str) -> dict:
                 "enabled": True,
                 "type": "platform",
                 "name": "skills",
-                "description": "Load and use skills from .claude/skills or .goose/skills directories",
+                "description": "Load skills from standard agent skill directories",
                 "bundled": True,
                 "available_tools": [],
             }
@@ -92,11 +79,15 @@ def render_overlay(workspace: str, model: str) -> dict:
     }
 
 
-def build_runtime_env(workspace: str, token: str) -> dict[str, str]:
+def build_runtime_env(workspace: str, token: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env["DATABRICKS_HOST"] = workspace
-    env["DATABRICKS_TOKEN"] = token
-    env["OAUTH_TOKEN"] = token
+    env.pop("OAUTH_TOKEN", None)
+    if token:
+        env["DATABRICKS_TOKEN"] = token
+    else:
+        # Do not let an ambient credential override Goose's refreshable OAuth.
+        env.pop("DATABRICKS_TOKEN", None)
     return env
 
 
@@ -104,34 +95,34 @@ def _mcp_slug(name: str) -> str:
     return name.lower().replace("-", "_")
 
 
-def build_mcp_server_entry(name: str, url: str, token: str = "") -> dict:
+def build_mcp_server_entry(name: str, argv: list[str]) -> dict:
     return {
         "enabled": True,
-        "type": "streamable_http",
+        "type": "stdio",
         "name": name,
         "description": f"Databricks MCP server: {name}",
-        "uri": url,
-        "envs": {GOOSE_MCP_AUTH_ENV_KEY: token},
+        "cmd": argv[0],
+        "args": list(argv[1:]),
+        "envs": {},
         "env_keys": [],
-        "headers": {"Authorization": f"Bearer ${{{GOOSE_MCP_AUTH_ENV_KEY}}}"},
         "timeout": 300,
         "bundled": None,
         "available_tools": [],
     }
 
 
-def write_mcp_server_config(name: str, url: str, token: str = "") -> bool:
+def write_mcp_server_config(name: str, argv: list[str]) -> bool:
     backup_existing_file(GOOSE_CONFIG_PATH, GOOSE_BACKUP_PATH)
     existing = read_yaml_safe(GOOSE_CONFIG_PATH)
     extensions = existing.get("extensions")
     if not isinstance(extensions, dict):
         extensions = {}
     slug = _mcp_slug(name)
-    removed = slug in extensions
-    extensions[slug] = build_mcp_server_entry(name, url, token)
+    replaced = slug in extensions
+    extensions[slug] = build_mcp_server_entry(name, argv)
     existing["extensions"] = extensions
     write_yaml_file(GOOSE_CONFIG_PATH, existing)
-    return removed
+    return replaced
 
 
 def remove_mcp_server_config(name: str) -> bool:
@@ -148,72 +139,35 @@ def remove_mcp_server_config(name: str) -> bool:
     return True
 
 
-def write_tool_config(
-    state: dict,
-    model: str,
-    token: str | None = None,
-    *,
-    force_refresh: bool = False,
-) -> tuple[dict, str]:
+def write_tool_config(state: dict, model: str) -> dict:
     backup_existing_file(GOOSE_CONFIG_PATH, GOOSE_BACKUP_PATH)
-    if token is None:
-        token = get_databricks_token(state["workspace"], force_refresh=force_refresh)
-    overlay = render_overlay(state["workspace"], model)
     existing = read_yaml_safe(GOOSE_CONFIG_PATH)
-    deep_merge_dict(existing, overlay)
-    extensions = existing.get("extensions")
-    if isinstance(extensions, dict):
-        for ext in extensions.values():
-            if isinstance(ext, dict) and ext.get("type") == "streamable_http":
-                envs = ext.get("envs")
-                if isinstance(envs, dict):
-                    envs[GOOSE_MCP_AUTH_ENV_KEY] = token
-                else:
-                    ext["envs"] = {GOOSE_MCP_AUTH_ENV_KEY: token}
+    deep_merge_dict(existing, render_overlay(state["workspace"], model))
     write_yaml_file(GOOSE_CONFIG_PATH, existing)
     state = mark_tool_managed(state, "goose", MANAGED_KEYS)
     save_state(state)
-    return state, token
+    return state
 
 
-def _refresh_token_once(state: dict, *, force_refresh: bool = False) -> tuple[str, str]:
+def _runtime_token(state: dict) -> str | None:
+    """PAT configurations are static; OAuth is delegated to Goose for refresh."""
+    if not state.get("use_pat"):
+        return None
+    return get_databricks_token(state["workspace"], state.get("profile"))
+
+
+def launch(state: dict, tool_args: list[str], *, options: LaunchOptions) -> None:
     model = default_model(state)
     if not model:
         raise RuntimeError("No Goose model is available on this workspace.")
-    _, token = write_tool_config(state, model, force_refresh=force_refresh)
-    return model, token
-
-
-def _refresh_forever(state: dict, stop_event: threading.Event) -> None:
-    while not stop_event.wait(TOKEN_REFRESH_INTERVAL_SECONDS):
-        try:
-            _refresh_token_once(state, force_refresh=True)
-        except RuntimeError:
-            continue
-
-
-def launch(state: dict, tool_args: list[str]) -> None:
-    model, token = _refresh_token_once(state)
-    env = build_runtime_env(state["workspace"], token)
-
-    stop_event = threading.Event()
-    refresher = threading.Thread(
-        target=_refresh_forever,
-        args=(state, stop_event),
-        daemon=True,
-    )
-    refresher.start()
-
-    proc = subprocess.Popen(["goose", "session", *tool_args], env=env)
+    write_tool_config(state, model)
+    env = build_runtime_env(state["workspace"], _runtime_token(state))
+    proc = subprocess.Popen([SPEC["binary"], "session", *tool_args], env=env)
     try:
         returncode = proc.wait()
     except KeyboardInterrupt:
         proc.send_signal(signal.SIGINT)
         returncode = proc.wait()
-    finally:
-        stop_event.set()
-        refresher.join(timeout=1)
-
     raise SystemExit(returncode)
 
 
@@ -235,5 +189,4 @@ def validate_env(state: dict) -> dict[str, str]:
         raise RuntimeError("No workspace configured.")
     if not default_model(state):
         raise RuntimeError("No Goose model is available on this workspace.")
-    token = get_databricks_token(workspace)
-    return build_runtime_env(workspace, token)
+    return build_runtime_env(workspace, _runtime_token(state))

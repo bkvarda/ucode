@@ -59,6 +59,18 @@ class TestRenderEnvOverlay:
         env = gemini.render_env_overlay(WS, "gemini-2", "tok")
         assert env["GEMINI_CLI_CUSTOM_HEADERS"] == "User-Agent:ucode/0.1.0 gemini/0.40.0"
 
+    def test_provider_adds_routing_header_and_pins_target(self, monkeypatch):
+        monkeypatch.setattr(gemini, "ucode_version", lambda: "0.1.0")
+        monkeypatch.setattr(gemini, "agent_version", lambda binary: "0.40.0")
+        env = gemini.render_env_overlay(
+            WS, "gemini-3.5-flash", "tok", provider="cat.sch.gemini-enterprise"
+        )
+        assert env["GEMINI_MODEL"] == "gemini-3.5-flash"
+        assert env["GEMINI_CLI_CUSTOM_HEADERS"] == (
+            "User-Agent:ucode/0.1.0 gemini/0.40.0,"
+            "Databricks-Model-Provider-Service:cat.sch.gemini-enterprise"
+        )
+
 
 class TestBuildRuntimeEnv:
     def test_merges_os_environment(self):
@@ -119,6 +131,42 @@ class TestGeminiDefaultModel:
 
     def test_returns_none_when_missing(self):
         assert gemini.default_model({}) is None
+
+    def test_gemini_default_model_wins_over_allowlist(self):
+        state = {
+            "gemini_default_model": "admin-chosen-default",
+            "gemini_models": ["gemini-2"],
+        }
+        assert gemini.default_model(state) == "admin-chosen-default"
+
+
+class TestGeminiVersionGating:
+    def test_too_new_version_flags_045(self, monkeypatch):
+        monkeypatch.setattr(gemini, "agent_version", lambda binary: "0.45.0-nightly.20260602")
+        assert gemini.too_new_version() == "0.45.0-nightly.20260602"
+
+    def test_too_new_version_allows_044(self, monkeypatch):
+        monkeypatch.setattr(gemini, "agent_version", lambda binary: "0.44.1")
+        assert gemini.too_new_version() is None
+
+    def test_too_new_version_none_when_unknown(self, monkeypatch):
+        monkeypatch.setattr(gemini, "agent_version", lambda binary: "unknown")
+        assert gemini.too_new_version() is None
+
+    def test_too_new_downgrade_returns_target(self, monkeypatch):
+        monkeypatch.setattr(gemini, "agent_version", lambda binary: "0.45.0-nightly.20260602")
+        monkeypatch.setattr(gemini, "latest_version_below", lambda pkg, ceiling: "0.44.1")
+        assert gemini.too_new_downgrade() == ("0.45.0-nightly.20260602", "0.44.1")
+
+    def test_too_new_downgrade_none_when_safe(self, monkeypatch):
+        monkeypatch.setattr(gemini, "agent_version", lambda binary: "0.44.1")
+        monkeypatch.setattr(gemini, "latest_version_below", lambda pkg, ceiling: "0.44.1")
+        assert gemini.too_new_downgrade() is None
+
+    def test_too_new_downgrade_none_when_no_target(self, monkeypatch):
+        monkeypatch.setattr(gemini, "agent_version", lambda binary: "0.45.0")
+        monkeypatch.setattr(gemini, "latest_version_below", lambda pkg, ceiling: None)
+        assert gemini.too_new_downgrade() is None
 
 
 class TestGeminiValidateCmd:
